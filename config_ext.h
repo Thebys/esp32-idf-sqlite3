@@ -42,7 +42,7 @@
 #define SQLITE_OMIT_CAST                     1
 #define SQLITE_OMIT_CHECK                    1
 #define SQLITE_OMIT_COMPILEOPTION_DIAGS      1
-#define SQLITE_OMIT_COMPOUND_SELECT          1
+#undef SQLITE_OMIT_COMPOUND_SELECT
 #define SQLITE_OMIT_CONFLICT_CLAUSE          1
 #undef SQLITE_OMIT_CTE
 #define SQLITE_OMIT_DECLTYPE                 1
