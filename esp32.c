@@ -358,18 +358,10 @@ int esp32_Open( sqlite3_vfs * vfs, const char * path, sqlite3_file * file, int f
 	strcpy(mode, "r");
 	if ( path == NULL ) return SQLITE_IOERR;
 	dbg_printf("esp32_Open: 0o %s %s\n", path, mode);
-	if( flags&SQLITE_OPEN_READONLY ) 
+	if( flags&SQLITE_OPEN_READONLY )
 		strcpy(mode, "r");
-	if( flags&SQLITE_OPEN_READWRITE || flags&SQLITE_OPEN_MAIN_JOURNAL ) {
-		int result;
-		if (SQLITE_OK != esp32_Access(vfs, path, flags, &result))
-			return SQLITE_CANTOPEN;
-
-		if (result == 1)
-            strcpy(mode, "r+");
-		else
-            strcpy(mode, "w+");
-	}
+	else if( flags&SQLITE_OPEN_READWRITE || flags&SQLITE_OPEN_MAIN_JOURNAL )
+		strcpy(mode, "r+");
 
 	dbg_printf("esp32_Open: 1o %s %s\n", path, mode);
 	memset (p, 0, sizeof(esp32_file));
@@ -390,6 +382,11 @@ int esp32_Open( sqlite3_vfs * vfs, const char * path, sqlite3_file * file, int f
 	}
 
 	p->fd = fopen(path, mode);
+	if ( p->fd <= 0 && strcmp(mode, "r+") == 0 ) {
+		/* r+ failed — file doesn't exist yet, create it with w+ */
+		strcpy(mode, "w+");
+		p->fd = fopen(path, mode);
+	}
     if ( p->fd <= 0 ) {
 		return SQLITE_CANTOPEN;
 	}
@@ -511,12 +508,13 @@ int esp32_Sync(sqlite3_file *id, int flags)
 
 int esp32_Access( sqlite3_vfs * vfs, const char * path, int flags, int * result )
 {
-	struct stat st;
-	memset(&st, 0, sizeof(struct stat));
-	int rc = stat( path, &st );
-	*result = ( rc != -1 );
+	/* Use fopen() instead of stat() to check file existence.
+	** stat() may be absent when CONFIG_VFS_SUPPORT_DIR=n. */
+	FILE *f = fopen(path, "r");
+	*result = (f != NULL);
+	if (f) fclose(f);
 
-	dbg_printf("esp32_Access: %s %d %d %ld\n", path, *result, rc, st.st_size);
+	dbg_printf("esp32_Access: %s %d\n", path, *result);
 	return SQLITE_OK;
 }
 
