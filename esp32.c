@@ -14,8 +14,16 @@
 #include <time.h>
 #include <unistd.h>
 #include <sqlite3.h>
-#include <esp_spi_flash.h>
+/* SPI_FLASH_SEC_SIZE (4096) is a hardware constant on all ESP32 variants.
+** Define it directly to avoid a build dependency on the spi_flash component,
+** which may not be on the include path depending on the build configuration. */
+#ifndef SPI_FLASH_SEC_SIZE
+#define SPI_FLASH_SEC_SIZE 4096
+#endif
 #include <esp_system.h>
+#if __has_include(<esp_random.h>)
+#include <esp_random.h>  /* esp_random() moved here in ESP-IDF 5.x */
+#endif
 #include <rom/ets_sys.h>
 #include <sys/stat.h>
 
@@ -335,8 +343,7 @@ int esp32mem_Write(sqlite3_file *id, const void *buffer, int amount, sqlite3_int
 
 int esp32mem_Sync(sqlite3_file *id, int flags)
 {
-	esp32_file *file = (esp32_file*) id;
-	dbg_printf("esp32mem_Sync: %s OK\n", file->name);
+	dbg_printf("esp32mem_Sync: OK\n");
 	return  SQLITE_OK;
 }
 
@@ -351,34 +358,28 @@ int esp32mem_FileSize(sqlite3_file *id, sqlite3_int64 *size)
 
 int esp32_Open( sqlite3_vfs * vfs, const char * path, sqlite3_file * file, int flags, int * outflags )
 {
-	int rc;
 	char mode[5];
 	esp32_file *p = (esp32_file*) file;
 
-	strcpy(mode, "r");
-	if ( path == NULL ) return SQLITE_IOERR;
-	dbg_printf("esp32_Open: 0o %s %s\n", path, mode);
-	if( flags&SQLITE_OPEN_READONLY ) 
-		strcpy(mode, "r");
-	if( flags&SQLITE_OPEN_READWRITE || flags&SQLITE_OPEN_MAIN_JOURNAL ) {
-		int result;
-		if (SQLITE_OK != esp32_Access(vfs, path, flags, &result))
-			return SQLITE_CANTOPEN;
-
-		if (result == 1)
-            strcpy(mode, "r+");
-		else
-            strcpy(mode, "w+");
-	}
-
-	dbg_printf("esp32_Open: 1o %s %s\n", path, mode);
+	/* Zero the file structure first — ensures pMethods is NULL even on
+	** early error return, as required by the SQLite VFS contract. */
 	memset (p, 0, sizeof(esp32_file));
 
-    strncpy (p->name, path, esp32_DEFAULT_MAXNAMESIZE);
+	if ( path == NULL ) return SQLITE_IOERR;
+
+	strcpy(mode, "r");
+	dbg_printf("esp32_Open: 0o %s %s\n", path, mode);
+	if( flags&SQLITE_OPEN_READONLY )
+		strcpy(mode, "r");
+	else if( flags&SQLITE_OPEN_READWRITE || flags&SQLITE_OPEN_MAIN_JOURNAL )
+		strcpy(mode, "r+");
+
+	dbg_printf("esp32_Open: 1o %s %s\n", path, mode);
+
+	strncpy (p->name, path, esp32_DEFAULT_MAXNAMESIZE);
 	p->name[esp32_DEFAULT_MAXNAMESIZE-1] = '\0';
 
 	if( flags&SQLITE_OPEN_MAIN_JOURNAL ) {
-		p->fd = 0;
 		p->cache = (filecache_t *) sqlite3_malloc(sizeof (filecache_t));
 		if (! p->cache )
 			return SQLITE_NOMEM;
@@ -386,15 +387,27 @@ int esp32_Open( sqlite3_vfs * vfs, const char * path, sqlite3_file * file, int f
 
 		p->base.pMethods = &esp32MemMethods;
 		dbg_printf("esp32_Open: 2o %s MEM OK\n", p->name);
+		if (outflags)
+			*outflags = flags;
 		return SQLITE_OK;
 	}
 
 	p->fd = fopen(path, mode);
-    if ( p->fd <= 0 ) {
+	if ( p->fd == NULL && (flags&SQLITE_OPEN_CREATE) && strcmp(mode, "r+") == 0 ) {
+		/* r+ failed and CREATE requested — create the file with w+ */
+		strcpy(mode, "w+");
+		p->fd = fopen(path, mode);
+	}
+	if ( p->fd == NULL ) {
 		return SQLITE_CANTOPEN;
 	}
 
 	p->base.pMethods = &esp32IoMethods;
+	if (outflags) {
+		*outflags = flags;
+		if (strcmp(mode, "r") == 0)
+			*outflags |= SQLITE_OPEN_READONLY;
+	}
 	dbg_printf("esp32_Open: 2o %s OK\n", p->name);
 	return SQLITE_OK;
 }
@@ -427,13 +440,10 @@ int esp32_Read(sqlite3_file *id, void *buffer, int amount, sqlite3_int64 offset)
 	if ( nRead == amount ) {
 	    dbg_printf("esp32_Read: 3r %s %u %d OK\n", file->name, nRead, amount);
 		return SQLITE_OK;
-	} else if ( nRead >= 0 ) {
-	    dbg_printf("esp32_Read: 3r %s %u %d FAIL\n", file->name, nRead, amount);
-		return SQLITE_IOERR_SHORT_READ;
 	}
 
-	dbg_printf("esp32_Read: 4r %s FAIL\n", file->name);
-	return SQLITE_IOERR_READ;
+	dbg_printf("esp32_Read: 3r %s %u %d FAIL\n", file->name, nRead, amount);
+	return SQLITE_IOERR_SHORT_READ;
 }
 
 int esp32_Write(sqlite3_file *id, const void *buffer, int amount, sqlite3_int64 offset)
@@ -463,13 +473,27 @@ int esp32_Write(sqlite3_file *id, const void *buffer, int amount, sqlite3_int64 
 int esp32_Truncate(sqlite3_file *id, sqlite3_int64 bytes)
 {
 	esp32_file *file = (esp32_file*) id;
-	//int fno = fileno(file->fd);
-	//if (fno == -1)
-	//	return SQLITE_IOERR_TRUNCATE;
-	//if (ftruncate(fno, 0))
-	//	return SQLITE_IOERR_TRUNCATE;
 
-	dbg_printf("esp32_Truncate:\n");
+	/* Memory-backed journal (fd==NULL): no-op */
+	if (file->fd == NULL) {
+		dbg_printf("esp32_Truncate: mem no-op\n");
+		return SQLITE_OK;
+	}
+
+	/* ftruncate is only available on POSIX hosts or when ESP-IDF is built
+	** with CONFIG_VFS_SUPPORT_DIR=y.  When absent, truncation is silently
+	** skipped — this matches the previous behavior and is acceptable for
+	** embedded use with SQLITE_OMIT_AUTOVACUUM and SQLITE_OMIT_WAL. */
+#if !defined(ESP_PLATFORM) || defined(CONFIG_VFS_SUPPORT_DIR)
+	int fno = fileno(file->fd);
+	if (fno == -1)
+		return SQLITE_IOERR_TRUNCATE;
+	if (ftruncate(fno, bytes))
+		return SQLITE_IOERR_TRUNCATE;
+	dbg_printf("esp32_Truncate: %s to %lld OK\n", file->name, bytes);
+#else
+	dbg_printf("esp32_Truncate: skipped (ftruncate unavailable)\n");
+#endif
 	return SQLITE_OK;
 }
 
@@ -511,27 +535,20 @@ int esp32_Sync(sqlite3_file *id, int flags)
 
 int esp32_Access( sqlite3_vfs * vfs, const char * path, int flags, int * result )
 {
-	struct stat st;
-	memset(&st, 0, sizeof(struct stat));
-	int rc = stat( path, &st );
-	*result = ( rc != -1 );
+	/* Use fopen() instead of stat() to check file existence.
+	** stat() may be absent when CONFIG_VFS_SUPPORT_DIR=n.
+	** Note: SQLITE_ACCESS_READWRITE checks directory writability and is
+	** only used by the temp_store_directory pragma — not relevant here. */
+	FILE *f = fopen(path, "r");
+	*result = (f != NULL);
+	if (f) fclose(f);
 
-	dbg_printf("esp32_Access: %s %d %d %ld\n", path, *result, rc, st.st_size);
+	dbg_printf("esp32_Access: %s %d\n", path, *result);
 	return SQLITE_OK;
 }
 
 int esp32_FullPathname( sqlite3_vfs * vfs, const char * path, int len, char * fullpath )
 {
-	//structure stat does not have name.
-	//struct stat st;
-	//int32_t rc = stat( path, &st );
-	//if ( rc == 0 ){
-	//	strncpy( fullpath, st.name, len );
-	//} else {
-	//	strncpy( fullpath, path, len );
-	//}
-
-	// As now just copy the path
 	strncpy( fullpath, path, len );
 	fullpath[ len - 1 ] = '\0';
 
@@ -541,24 +558,18 @@ int esp32_FullPathname( sqlite3_vfs * vfs, const char * path, int len, char * fu
 
 int esp32_Lock(sqlite3_file *id, int lock_type)
 {
-	esp32_file *file = (esp32_file*) id;
-
 	dbg_printf("esp32_Lock:Not locked\n");
 	return SQLITE_OK;
 }
 
 int esp32_Unlock(sqlite3_file *id, int lock_type)
 {
-	esp32_file *file = (esp32_file*) id;
-
 	dbg_printf("esp32_Unlock:\n");
 	return SQLITE_OK;
 }
 
 int esp32_CheckReservedLock(sqlite3_file *id, int *result)
 {
-	esp32_file *file = (esp32_file*) id;
-
 	*result = 0;
 
 	dbg_printf("esp32_CheckReservedLock:\n");
@@ -567,24 +578,18 @@ int esp32_CheckReservedLock(sqlite3_file *id, int *result)
 
 int esp32_FileControl(sqlite3_file *id, int op, void *arg)
 {
-	esp32_file *file = (esp32_file*) id;
-
-	dbg_printf("esp32_FileControl:\n");
-	return SQLITE_OK;
+	dbg_printf("esp32_FileControl: %d\n", op);
+	return SQLITE_NOTFOUND;
 }
 
 int esp32_SectorSize(sqlite3_file *id)
 {
-	esp32_file *file = (esp32_file*) id;
-
 	dbg_printf("esp32_SectorSize:\n");
 	return SPI_FLASH_SEC_SIZE;
 }
 
 int esp32_DeviceCharacteristics(sqlite3_file *id)
 {
-	esp32_file *file = (esp32_file*) id;
-
 	dbg_printf("esp32_DeviceCharacteristics:\n");
 	return 0;
 }
